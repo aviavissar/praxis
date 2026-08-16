@@ -23,7 +23,7 @@ use crate::{FilterAction, filter::HttpFilter as _};
 fn match_root() {
     let router = make_router(vec![prefix_route("/", "default")]);
     let route = router.match_route("/anything", None, &HeaderMap::new()).unwrap();
-    assert_eq!(&*route.cluster, "default", "root prefix should match any path");
+    assert_eq!(&*route.route.cluster, "default", "root prefix should match any path");
 }
 
 #[test]
@@ -31,10 +31,13 @@ fn longest_prefix_wins() {
     let router = make_router(vec![prefix_route("/", "default"), prefix_route("/api/", "api")]);
 
     let route = router.match_route("/api/users", None, &HeaderMap::new()).unwrap();
-    assert_eq!(&*route.cluster, "api", "longer /api/ prefix should win");
+    assert_eq!(&*route.route.cluster, "api", "longer /api/ prefix should win");
 
     let route = router.match_route("/static/main.js", None, &HeaderMap::new()).unwrap();
-    assert_eq!(&*route.cluster, "default", "non-api path should fall back to root");
+    assert_eq!(
+        &*route.route.cluster, "default",
+        "non-api path should fall back to root"
+    );
 }
 
 #[test]
@@ -55,7 +58,7 @@ fn host_filtering() {
         .match_route("/", Some("api.example.com"), &HeaderMap::new())
         .unwrap();
     assert_eq!(
-        &*route.cluster, "api",
+        &*route.route.cluster, "api",
         "matching host should select host-specific route"
     );
 
@@ -63,7 +66,7 @@ fn host_filtering() {
         .match_route("/", Some("other.example.com"), &HeaderMap::new())
         .unwrap();
     assert_eq!(
-        &*route.cluster, "default",
+        &*route.route.cluster, "default",
         "non-matching host should fall back to default"
     );
 }
@@ -83,7 +86,7 @@ fn host_with_port() {
         .match_route("/", Some("api.example.com:8080"), &HeaderMap::new())
         .unwrap();
     assert_eq!(
-        &*route.cluster, "api",
+        &*route.route.cluster, "api",
         "host with port should match after stripping port"
     );
 }
@@ -182,6 +185,32 @@ async fn on_request_sets_cluster_on_match() {
 }
 
 #[tokio::test]
+async fn on_request_metrics_route_distinguishes_exact_and_prefix() {
+    let router = make_router(vec![
+        exact_route("/api/v1", "exact-cluster"),
+        prefix_route("/other", "prefix-cluster"),
+    ]);
+
+    let exact_req = crate::test_utils::make_request(http::Method::GET, "/api/v1");
+    let mut exact_ctx = crate::test_utils::make_filter_context(&exact_req);
+    drop(router.on_request(&mut exact_ctx).await.unwrap());
+    assert_eq!(
+        exact_ctx.metrics_route.as_deref(),
+        Some("/api/v1"),
+        "Exact route label must be the bare path"
+    );
+
+    let prefix_req = crate::test_utils::make_request(http::Method::GET, "/other/x");
+    let mut prefix_ctx = crate::test_utils::make_filter_context(&prefix_req);
+    drop(router.on_request(&mut prefix_ctx).await.unwrap());
+    assert_eq!(
+        prefix_ctx.metrics_route.as_deref(),
+        Some("/other*"),
+        "Prefix route label must append '*' so it differs from Exact"
+    );
+}
+
+#[tokio::test]
 async fn on_request_rejects_on_no_match() {
     let router = make_router(vec![prefix_route("/api/", "api")]);
     let req = crate::test_utils::make_request(http::Method::GET, "/other");
@@ -243,7 +272,7 @@ fn route_matches_by_header() {
     hdrs.insert("x-model", HeaderValue::from_static("model-alpha-1"));
     let route = router.match_route("/chat", None, &hdrs).unwrap();
     assert_eq!(
-        &*route.cluster, "alpha_cluster",
+        &*route.route.cluster, "alpha_cluster",
         "matching header should select header-constrained route"
     );
 }
@@ -285,7 +314,7 @@ fn route_with_headers_wins_over_plain() {
     hdrs.insert("x-model", HeaderValue::from_static("model-alpha-1"));
     let route = router.match_route("/chat", None, &hdrs).unwrap();
     assert_eq!(
-        &*route.cluster, "alpha_cluster",
+        &*route.route.cluster, "alpha_cluster",
         "header-constrained route should win over plain"
     );
 }
@@ -308,7 +337,7 @@ fn route_without_headers_used_as_fallback() {
     hdrs.insert("x-model", HeaderValue::from_static("model-beta-2"));
     let route = router.match_route("/chat", None, &hdrs).unwrap();
     assert_eq!(
-        &*route.cluster, "default",
+        &*route.route.cluster, "default",
         "non-matching header should fall back to default"
     );
 }
@@ -357,7 +386,7 @@ fn multi_value_header_matches_any() {
     hdrs.append("x-model", HeaderValue::from_static("model-alpha-1"));
     let route = router.match_route("/chat", None, &hdrs).unwrap();
     assert_eq!(
-        &*route.cluster, "alpha_cluster",
+        &*route.route.cluster, "alpha_cluster",
         "any matching value in multi-value header should match"
     );
 }
@@ -374,7 +403,7 @@ fn ipv6_host_with_port() {
     }]);
 
     let route = router.match_route("/", Some("[::1]:8080"), &HeaderMap::new()).unwrap();
-    assert_eq!(&*route.cluster, "ipv6", "bracketed IPv6 with port should match");
+    assert_eq!(&*route.route.cluster, "ipv6", "bracketed IPv6 with port should match");
 }
 
 #[test]
@@ -389,7 +418,10 @@ fn ipv6_host_without_port() {
     }]);
 
     let route = router.match_route("/", Some("[::1]"), &HeaderMap::new()).unwrap();
-    assert_eq!(&*route.cluster, "ipv6", "bracketed IPv6 without port should match");
+    assert_eq!(
+        &*route.route.cluster, "ipv6",
+        "bracketed IPv6 without port should match"
+    );
 }
 
 #[test]
@@ -419,7 +451,7 @@ fn route_with_host_and_headers() {
     hdrs.insert("x-version", HeaderValue::from_static("v2"));
     let route = router.match_route("/", Some("api.example.com"), &hdrs).unwrap();
     assert_eq!(
-        &*route.cluster, "api-v2",
+        &*route.route.cluster, "api-v2",
         "route with both host and headers should match"
     );
 }
@@ -450,7 +482,7 @@ fn same_prefix_same_constraints_first_wins() {
     hdrs.insert("x-b", HeaderValue::from_static("2"));
     let route = router.match_route("/", None, &hdrs).unwrap();
     assert_eq!(
-        &*route.cluster, "first",
+        &*route.route.cluster, "first",
         "equal-constraint routes should prefer first match"
     );
 }
@@ -467,7 +499,10 @@ fn empty_headers_map_matches_everything() {
     }]);
 
     let route = router.match_route("/test", None, &HeaderMap::new()).unwrap();
-    assert_eq!(&*route.cluster, "vacuous", "empty headers map should match everything");
+    assert_eq!(
+        &*route.route.cluster, "vacuous",
+        "empty headers map should match everything"
+    );
 }
 
 #[tokio::test]
@@ -501,7 +536,7 @@ fn route_matches_request_path_only_hit() {
     let route = prefix_route("/api/", "api");
     let resolved = ResolvedRoute {
         route,
-        json_aliases: None,
+        metrics_label: ::metrics::SharedString::const_str("/"),
         wildcard_suffix: None,
     };
     assert!(
@@ -515,7 +550,7 @@ fn route_matches_request_path_miss() {
     let route = prefix_route("/api/", "api");
     let resolved = ResolvedRoute {
         route,
-        json_aliases: None,
+        metrics_label: ::metrics::SharedString::const_str("/"),
         wildcard_suffix: None,
     };
     assert!(
@@ -536,7 +571,7 @@ fn route_matches_request_host_hit() {
     };
     let resolved = ResolvedRoute {
         route,
-        json_aliases: None,
+        metrics_label: ::metrics::SharedString::const_str("/"),
         wildcard_suffix: None,
     };
     assert!(
@@ -557,7 +592,7 @@ fn route_matches_request_host_miss() {
     };
     let resolved = ResolvedRoute {
         route,
-        json_aliases: None,
+        metrics_label: ::metrics::SharedString::const_str("/"),
         wildcard_suffix: None,
     };
     assert!(
@@ -578,7 +613,7 @@ fn route_matches_request_host_miss_when_no_host() {
     };
     let resolved = ResolvedRoute {
         route,
-        json_aliases: None,
+        metrics_label: ::metrics::SharedString::const_str("/"),
         wildcard_suffix: None,
     };
     assert!(
@@ -599,7 +634,7 @@ fn route_matches_request_header_hit() {
     };
     let resolved = ResolvedRoute {
         route,
-        json_aliases: None,
+        metrics_label: ::metrics::SharedString::const_str("/"),
         wildcard_suffix: None,
     };
     let mut hdrs = HeaderMap::new();
@@ -622,7 +657,7 @@ fn route_matches_request_header_miss() {
     };
     let resolved = ResolvedRoute {
         route,
-        json_aliases: None,
+        metrics_label: ::metrics::SharedString::const_str("/"),
         wildcard_suffix: None,
     };
     let mut hdrs = HeaderMap::new();
@@ -645,7 +680,7 @@ fn route_matches_request_compound() {
     };
     let resolved = ResolvedRoute {
         route,
-        json_aliases: None,
+        metrics_label: ::metrics::SharedString::const_str("/"),
         wildcard_suffix: None,
     };
     let mut hdrs = HeaderMap::new();
@@ -769,7 +804,7 @@ fn route_matches_request_empty_headers_constraint() {
     };
     let resolved = ResolvedRoute {
         route,
-        json_aliases: None,
+        metrics_label: ::metrics::SharedString::const_str("/"),
         wildcard_suffix: None,
     };
     let mut hdrs = HeaderMap::new();
@@ -814,7 +849,7 @@ fn prefix_without_trailing_slash_accepted() {
     let router = make_router(vec![prefix_route("/api", "api"), prefix_route("/", "default")]);
     let route = router.match_route("/api/v1", None, &HeaderMap::new()).unwrap();
     assert_eq!(
-        &*route.cluster, "api",
+        &*route.route.cluster, "api",
         "/api/v1 should match /api prefix without trailing slash"
     );
 }
@@ -823,21 +858,21 @@ fn prefix_without_trailing_slash_accepted() {
 fn segment_boundary_rejects_non_segment_continuation() {
     let router = make_router(vec![prefix_route("/api", "api"), prefix_route("/", "default")]);
     let route = router.match_route("/apikeys", None, &HeaderMap::new()).unwrap();
-    assert_eq!(&*route.cluster, "default", "/apikeys must NOT match /api prefix");
+    assert_eq!(&*route.route.cluster, "default", "/apikeys must NOT match /api prefix");
 }
 
 #[test]
 fn segment_boundary_exact_path_match() {
     let router = make_router(vec![prefix_route("/api", "api"), prefix_route("/", "default")]);
     let route = router.match_route("/api", None, &HeaderMap::new()).unwrap();
-    assert_eq!(&*route.cluster, "api", "/api should match /api prefix exactly");
+    assert_eq!(&*route.route.cluster, "api", "/api should match /api prefix exactly");
 }
 
 #[test]
 fn segment_boundary_trailing_slash_on_path() {
     let router = make_router(vec![prefix_route("/api", "api"), prefix_route("/", "default")]);
     let route = router.match_route("/api/", None, &HeaderMap::new()).unwrap();
-    assert_eq!(&*route.cluster, "api", "/api/ should match /api prefix");
+    assert_eq!(&*route.route.cluster, "api", "/api/ should match /api prefix");
 }
 
 #[test]
@@ -849,7 +884,7 @@ fn prefix_with_and_without_trailing_slash_equivalent() {
         let m1 = r1.match_route(path, None, &HeaderMap::new()).unwrap();
         let m2 = r2.match_route(path, None, &HeaderMap::new()).unwrap();
         assert_eq!(
-            &*m1.cluster, &*m2.cluster,
+            &*m1.route.cluster, &*m2.route.cluster,
             "prefix /api and /api/ should behave identically for path {path}"
         );
     }
@@ -870,7 +905,7 @@ fn wildcard_host_matches_subdomain() {
         .match_route("/", Some("api.example.com"), &HeaderMap::new())
         .unwrap();
     assert_eq!(
-        &*route.cluster, "wildcard",
+        &*route.route.cluster, "wildcard",
         "*.example.com should match api.example.com"
     );
 }
@@ -948,7 +983,7 @@ fn wildcard_host_with_port() {
         .match_route("/", Some("www.example.com:8080"), &HeaderMap::new())
         .unwrap();
     assert_eq!(
-        &*route.cluster, "wildcard",
+        &*route.route.cluster, "wildcard",
         "wildcard host should match after stripping port"
     );
 }
@@ -968,7 +1003,7 @@ fn wildcard_host_case_insensitive() {
         .match_route("/", Some("API.example.com"), &HeaderMap::new())
         .unwrap();
     assert_eq!(
-        &*route.cluster, "wildcard",
+        &*route.route.cluster, "wildcard",
         "wildcard host matching should be case-insensitive"
     );
 }
@@ -991,13 +1026,13 @@ fn wildcard_host_with_fallback() {
         .match_route("/", Some("api.example.com"), &HeaderMap::new())
         .unwrap();
     assert_eq!(
-        &*route.cluster, "wildcard",
+        &*route.route.cluster, "wildcard",
         "wildcard route should match api.example.com"
     );
 
     let route = router.match_route("/", Some("other.dev"), &HeaderMap::new()).unwrap();
     assert_eq!(
-        &*route.cluster, "default",
+        &*route.route.cluster, "default",
         "non-matching host should fall back to default"
     );
 }
@@ -1027,7 +1062,7 @@ fn exact_host_wins_over_wildcard_same_constraints() {
         .match_route("/", Some("api.example.com"), &HeaderMap::new())
         .unwrap();
     assert_eq!(
-        &*route.cluster, "exact",
+        &*route.route.cluster, "exact",
         "exact host match should win over wildcard (first-match semantics)"
     );
 }
@@ -1135,27 +1170,43 @@ async fn on_request_rewritten_path_no_match_still_rejects() {
 fn exact_path_matches_only_exact() {
     let router = make_router(vec![exact_route("/one", "exact"), prefix_route("/", "fallback")]);
     assert_eq!(
-        &*router.match_route("/one", None, &HeaderMap::new()).unwrap().cluster,
+        &*router
+            .match_route("/one", None, &HeaderMap::new())
+            .unwrap()
+            .route
+            .cluster,
         "exact",
         "/one should match exact route"
     );
     assert_eq!(
-        &*router.match_route("/", None, &HeaderMap::new()).unwrap().cluster,
+        &*router.match_route("/", None, &HeaderMap::new()).unwrap().route.cluster,
         "fallback",
         "/ should match fallback"
     );
     assert_eq!(
-        &*router.match_route("/one/sub", None, &HeaderMap::new()).unwrap().cluster,
+        &*router
+            .match_route("/one/sub", None, &HeaderMap::new())
+            .unwrap()
+            .route
+            .cluster,
         "fallback",
         "/one/sub should NOT match exact /one"
     );
     assert_eq!(
-        &*router.match_route("/one/", None, &HeaderMap::new()).unwrap().cluster,
+        &*router
+            .match_route("/one/", None, &HeaderMap::new())
+            .unwrap()
+            .route
+            .cluster,
         "fallback",
         "/one/ should NOT match exact /one"
     );
     assert_eq!(
-        &*router.match_route("/ONE", None, &HeaderMap::new()).unwrap().cluster,
+        &*router
+            .match_route("/ONE", None, &HeaderMap::new())
+            .unwrap()
+            .route
+            .cluster,
         "fallback",
         "/ONE should NOT match exact /one (case-sensitive)"
     );
@@ -1169,17 +1220,29 @@ fn exact_path_dominates_prefix() {
         prefix_route("/", "root"),
     ]);
     assert_eq!(
-        &*router.match_route("/api", None, &HeaderMap::new()).unwrap().cluster,
+        &*router
+            .match_route("/api", None, &HeaderMap::new())
+            .unwrap()
+            .route
+            .cluster,
         "exact",
         "exact /api should win over prefix /api/"
     );
     assert_eq!(
-        &*router.match_route("/api/v1", None, &HeaderMap::new()).unwrap().cluster,
+        &*router
+            .match_route("/api/v1", None, &HeaderMap::new())
+            .unwrap()
+            .route
+            .cluster,
         "prefix",
         "/api/v1 should match prefix /api/"
     );
     assert_eq!(
-        &*router.match_route("/other", None, &HeaderMap::new()).unwrap().cluster,
+        &*router
+            .match_route("/other", None, &HeaderMap::new())
+            .unwrap()
+            .route
+            .cluster,
         "root",
         "/other should match root /"
     );
@@ -1202,6 +1265,7 @@ fn exact_path_with_host_constraint() {
         &*router
             .match_route("/health", Some("api.example.com"), &HeaderMap::new())
             .unwrap()
+            .route
             .cluster,
         "api-health",
         "host-constrained exact should win"
@@ -1210,12 +1274,17 @@ fn exact_path_with_host_constraint() {
         &*router
             .match_route("/health", Some("other.example.com"), &HeaderMap::new())
             .unwrap()
+            .route
             .cluster,
         "any-health",
         "unconstrained exact should match other hosts"
     );
     assert_eq!(
-        &*router.match_route("/health", None, &HeaderMap::new()).unwrap().cluster,
+        &*router
+            .match_route("/health", None, &HeaderMap::new())
+            .unwrap()
+            .route
+            .cluster,
         "any-health",
         "unconstrained exact should match no host"
     );
@@ -1239,12 +1308,16 @@ fn exact_path_with_headers() {
     let mut req_headers = HeaderMap::new();
     req_headers.insert("x-version", "v2".parse().unwrap());
     assert_eq!(
-        &*router.match_route("/api", None, &req_headers).unwrap().cluster,
+        &*router.match_route("/api", None, &req_headers).unwrap().route.cluster,
         "v2",
         "exact with matching headers should win"
     );
     assert_eq!(
-        &*router.match_route("/api", None, &HeaderMap::new()).unwrap().cluster,
+        &*router
+            .match_route("/api", None, &HeaderMap::new())
+            .unwrap()
+            .route
+            .cluster,
         "default",
         "exact without matching headers should fall back"
     );
@@ -1270,15 +1343,27 @@ fn multiple_exact_paths() {
         exact_route("/three", "c3"),
     ]);
     assert_eq!(
-        &*router.match_route("/one", None, &HeaderMap::new()).unwrap().cluster,
+        &*router
+            .match_route("/one", None, &HeaderMap::new())
+            .unwrap()
+            .route
+            .cluster,
         "c1"
     );
     assert_eq!(
-        &*router.match_route("/two", None, &HeaderMap::new()).unwrap().cluster,
+        &*router
+            .match_route("/two", None, &HeaderMap::new())
+            .unwrap()
+            .route
+            .cluster,
         "c2"
     );
     assert_eq!(
-        &*router.match_route("/three", None, &HeaderMap::new()).unwrap().cluster,
+        &*router
+            .match_route("/three", None, &HeaderMap::new())
+            .unwrap()
+            .route
+            .cluster,
         "c3"
     );
     assert!(
@@ -1307,6 +1392,7 @@ fn mixed_exact_and_prefix_ordering() {
         &*router
             .match_route("/api/v1/users", None, &HeaderMap::new())
             .unwrap()
+            .route
             .cluster,
         "exact-users"
     );
@@ -1314,6 +1400,7 @@ fn mixed_exact_and_prefix_ordering() {
         &*router
             .match_route("/api/v1/posts", None, &HeaderMap::new())
             .unwrap()
+            .route
             .cluster,
         "prefix-v1"
     );
@@ -1321,11 +1408,16 @@ fn mixed_exact_and_prefix_ordering() {
         &*router
             .match_route("/api/v2/other", None, &HeaderMap::new())
             .unwrap()
+            .route
             .cluster,
         "prefix-api"
     );
     assert_eq!(
-        &*router.match_route("/other", None, &HeaderMap::new()).unwrap().cluster,
+        &*router
+            .match_route("/other", None, &HeaderMap::new())
+            .unwrap()
+            .route
+            .cluster,
         "root"
     );
 }
@@ -1437,8 +1529,8 @@ fn json_alias_validation_empty_target_rejected() {
 }
 
 #[test]
-fn json_alias_config_stores_header_and_max_bytes() {
-    let filter = RouterFilter::with_alias_options(
+fn json_aliases_are_rejected_at_construction() {
+    let err = RouterFilter::with_alias_options(
         vec![json_alias_route(
             "/",
             "test",
@@ -1447,54 +1539,46 @@ fn json_alias_config_stores_header_and_max_bytes() {
         "X-Tenant",
         4096,
     )
-    .unwrap();
+    .unwrap_err();
 
-    assert_eq!(
-        filter.json_alias_header.as_str(),
-        "x-tenant",
-        "custom json_alias_header"
+    assert!(
+        err.to_string().contains("not applied to routing decisions"),
+        "json_aliases must fail loudly rather than be stored and ignored: {err}"
     );
-    assert_eq!(filter.json_alias_max_body_bytes, 4096, "custom max body bytes");
+    assert!(
+        err.to_string().contains("test"),
+        "the error should name the offending cluster: {err}"
+    );
 }
 
 #[test]
-fn json_alias_config_preserves_route_count() {
-    let filter = make_alias_config_filter();
-    assert_eq!(filter.routes.len(), 3, "should have 3 routes");
+fn json_alias_rejection_names_the_first_offending_route() {
+    let err = RouterFilter::with_alias_options(
+        vec![
+            router_route("/plain", "no-aliases", None),
+            json_alias_route("/aliased", "has-aliases", vec![("model", "fast", None)]),
+        ],
+        super::config::DEFAULT_JSON_ALIAS_HEADER,
+        super::config::DEFAULT_JSON_ALIAS_MAX_BODY_BYTES,
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string().contains("has-aliases"),
+        "the error should name the cluster that carries aliases: {err}"
+    );
 }
 
 #[test]
-fn json_alias_config_preserves_provider_b_alias() {
-    let filter = make_alias_config_filter();
-    let provider_b = find_resolved_route(&filter, "provider-b");
-    let aliases = provider_b.json_aliases.as_ref().unwrap();
+fn routes_without_aliases_are_unaffected() {
+    let filter = RouterFilter::with_alias_options(
+        vec![router_route("/", "test", None)],
+        super::config::DEFAULT_JSON_ALIAS_HEADER,
+        super::config::DEFAULT_JSON_ALIAS_MAX_BODY_BYTES,
+    )
+    .expect("routes without json_aliases should still build");
 
-    assert_eq!(aliases.len(), 1, "provider-b should have 1 alias");
-    assert_eq!(aliases[0].field, "model", "provider-b alias field");
-    assert_eq!(aliases[0].pattern, "model-a-*", "wildcard alias pattern");
-    assert!(aliases[0].target.is_none(), "wildcard alias should have no target");
-}
-
-#[test]
-fn json_alias_config_preserves_provider_a_aliases() {
-    let filter = make_alias_config_filter();
-    let provider_a = find_resolved_route(&filter, "provider-a");
-    let aliases = provider_a.json_aliases.as_ref().unwrap();
-
-    assert_eq!(aliases.len(), 2, "provider-a should have 2 aliases");
-    assert_eq!(aliases[0].field, "model", "first alias field");
-    assert_eq!(aliases[0].pattern, "fast", "first alias pattern");
-    assert_eq!(aliases[0].target.as_deref(), Some("model-fast"), "first alias target");
-    assert_eq!(aliases[1].field, "tenant_id", "second alias field");
-    assert_eq!(aliases[1].pattern, "cheap", "second alias pattern");
-}
-
-#[test]
-fn json_alias_config_preserves_fallback_without_aliases() {
-    let filter = make_alias_config_filter();
-    let fallback = find_resolved_route(&filter, "fallback");
-
-    assert!(fallback.json_aliases.is_none(), "fallback should have no aliases");
+    assert_eq!(filter.routes.len(), 1, "route table should be built as usual");
 }
 
 #[test]
@@ -1542,11 +1626,16 @@ fn json_alias_from_config_parses_fallback_without_aliases() {
 }
 
 #[test]
-fn json_alias_from_config_builds_filter() {
+fn json_alias_from_config_is_rejected() {
     let yaml = serde_yaml::from_str::<serde_yaml::Value>(json_alias_config_yaml()).unwrap();
-    let filter = RouterFilter::from_config(&yaml).unwrap();
+    let Err(err) = RouterFilter::from_config(&yaml) else {
+        panic!("a config carrying json_aliases must fail to build");
+    };
 
-    assert_eq!(filter.name(), "router", "from_config should produce a valid router");
+    assert!(
+        err.to_string().contains("not applied to routing decisions"),
+        "unexpected error for a config carrying json_aliases: {err}"
+    );
 }
 
 #[test]
@@ -1631,8 +1720,8 @@ fn json_alias_validate_max_bytes_above_upper_bound_rejected() {
 }
 
 #[test]
-fn json_alias_validate_max_bytes_at_upper_bound_accepted() {
-    let result = RouterFilter::with_alias_options(
+fn json_alias_max_bytes_at_upper_bound_passes_bounds_check() {
+    let err = RouterFilter::with_alias_options(
         vec![json_alias_route(
             "/",
             "test",
@@ -1640,8 +1729,15 @@ fn json_alias_validate_max_bytes_at_upper_bound_accepted() {
         )],
         super::config::DEFAULT_JSON_ALIAS_HEADER,
         super::config::MAX_JSON_ALIAS_BODY_BYTES,
+    )
+    .unwrap_err();
+
+    // Exactly at the upper bound clears the bounds check, so the only
+    // remaining objection is that the feature is not implemented.
+    assert!(
+        err.to_string().contains("not applied to routing decisions"),
+        "upper bound should clear the size check and fail only on the feature gate: {err}"
     );
-    assert!(result.is_ok(), "exactly at upper bound should be accepted");
 }
 
 // -----------------------------------------------------------------------------
@@ -1720,34 +1816,4 @@ fn json_alias_route(prefix: &str, cluster: &str, aliases: Vec<(&str, &str, Optio
                 .collect(),
         ),
     )
-}
-
-/// Build the standard three-route alias config used by multiple tests.
-fn make_alias_config_filter() -> RouterFilter {
-    RouterFilter::with_alias_options(
-        vec![
-            json_alias_route(
-                "/v1/chat/",
-                "provider-a",
-                vec![
-                    ("model", "fast", Some("model-fast")),
-                    ("tenant_id", "cheap", Some("tenant-cheap")),
-                ],
-            ),
-            json_alias_route("/v1/messages/", "provider-b", vec![("model", "model-a-*", None)]),
-            router_route("/", "fallback", None),
-        ],
-        "X-AI-Model",
-        4096,
-    )
-    .unwrap()
-}
-
-/// Find a route by cluster name (panics if not found).
-fn find_resolved_route<'a>(filter: &'a RouterFilter, cluster: &str) -> &'a ResolvedRoute {
-    filter
-        .routes
-        .iter()
-        .find(|r| &*r.route.cluster == cluster)
-        .unwrap_or_else(|| panic!("no route with cluster '{cluster}'"))
 }

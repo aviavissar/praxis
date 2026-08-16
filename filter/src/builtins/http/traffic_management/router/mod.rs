@@ -86,21 +86,6 @@ use crate::{
 /// [`rewritten_path`]: crate::HttpFilterContext::rewritten_path
 #[derive(Debug)]
 pub struct RouterFilter {
-    /// Whether any route has JSON aliases configured.
-    #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on struct fields")]
-    #[allow(dead_code, reason = "alias config is validated before body access is wired")]
-    has_json_alias_routes: bool,
-
-    /// Maximum body bytes to buffer for JSON alias resolution.
-    #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on struct fields")]
-    #[allow(dead_code, reason = "alias config is validated before body buffering is wired")]
-    json_alias_max_body_bytes: usize,
-
-    /// Header name for the promoted JSON alias value.
-    #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on struct fields")]
-    #[allow(dead_code, reason = "alias config is validated before header promotion is wired")]
-    json_alias_header: HeaderName,
-
     /// Enable multi-level subdomain matching for wildcard hosts.
     multi_level_subdomain_matching: bool,
 
@@ -115,8 +100,8 @@ struct ResolvedRoute {
     route: Route,
 
     /// Optional JSON aliases configured on this route.
-    json_aliases: Option<Vec<JsonAlias>>,
-
+    /// Pre-computed `route` label (Exact: bare path; Prefix: `path*`).
+    metrics_label: ::metrics::SharedString,
     /// For wildcard hosts (e.g. `*.example.com`), the pre-lowercased
     /// suffix with leading dot: `.example.com`. `None` for exact hosts
     /// or routes without a host constraint.
@@ -181,21 +166,13 @@ impl RouterFilter {
         let mut routes = routes;
         sort_routes(&mut routes);
         validate_json_aliases(&routes)?;
-        let json_alias_header = parse_json_alias_header(json_alias_header)?;
+        let _json_alias_header = parse_json_alias_header(json_alias_header)?;
         validate_alias_options(&routes, json_alias_max_body_bytes)?;
-
-        let has_json_alias_routes = routes.iter().any(|r| r.json_aliases.is_some());
+        reject_unimplemented_json_aliases(&routes)?;
 
         let resolved = resolve_routes(routes);
-        debug!(
-            routes = resolved.len(),
-            has_aliases = has_json_alias_routes,
-            "router initialized"
-        );
+        debug!(routes = resolved.len(), "router initialized");
         Ok(Self {
-            has_json_alias_routes,
-            json_alias_max_body_bytes,
-            json_alias_header,
             multi_level_subdomain_matching: false,
             routes: resolved,
         })
@@ -230,21 +207,34 @@ impl RouterFilter {
     ///
     /// When multiple routes share the same prefix length, the route with
     /// more constraints (host presence + header count) wins.
-    fn match_route(&self, path: &str, host: Option<&str>, req_headers: &HeaderMap) -> Option<&Route> {
-        let mut best: Option<(matching::Specificity, &Route)> = None;
+    fn match_route(&self, path: &str, host: Option<&str>, req_headers: &HeaderMap) -> Option<&ResolvedRoute> {
+        let mut best: Option<(matching::Specificity, &ResolvedRoute)> = None;
 
         for resolved in &self.routes {
             let route = &resolved.route;
             if !route_matches_request(resolved, path, host, req_headers, self.multi_level_subdomain_matching) {
                 continue;
             }
-            best = update_best_match(best, route);
-            if should_stop_early(best, route) {
+            best = update_best_resolved(best, resolved);
+            if should_stop_early(best.map(|(s, r)| (s, &r.route)), route) {
                 break;
             }
         }
 
         best.map(|(_, r)| r)
+    }
+}
+
+/// Prefer the more-specific resolved route (same rules as [`update_best_match`]).
+fn update_best_resolved<'a>(
+    best: Option<(matching::Specificity, &'a ResolvedRoute)>,
+    candidate: &'a ResolvedRoute,
+) -> Option<(matching::Specificity, &'a ResolvedRoute)> {
+    let updated = update_best_match(best.map(|(s, r)| (s, &r.route)), &candidate.route);
+    match (updated, best) {
+        (None, _) => None,
+        (Some((spec, route)), Some((_, prev))) if std::ptr::eq(route, &prev.route) => Some((spec, prev)),
+        (Some((spec, _)), _) => Some((spec, candidate)),
     }
 }
 
@@ -322,6 +312,35 @@ fn parse_json_alias_header(json_alias_header: &str) -> Result<HeaderName, Filter
     })
 }
 
+/// Rejects `json_aliases`, which the schema accepts but the request
+/// path never consults.
+///
+/// The alias config is parsed, shape-checked, and stored, but
+/// [`RouterFilter::on_request`] matches on path, host, and headers
+/// only — nothing reads the aliases, and no body is buffered to
+/// evaluate them against. Accepting the key would leave an operator
+/// believing traffic is being split on a JSON field when every request
+/// is in fact routed by path alone, which is precisely the kind of
+/// silent divergence a proxy must not have.
+///
+/// Failing at construction turns that into a startup error. The
+/// groundwork (`json_alias` matching, shape validation) is left in
+/// place; wiring the feature up means deleting this check, not
+/// rebuilding it.
+fn reject_unimplemented_json_aliases(routes: &[RouterRouteConfig]) -> Result<(), FilterError> {
+    let Some(route_config) = routes.iter().find(|r| r.json_aliases.is_some()) else {
+        return Ok(());
+    };
+    Err(format!(
+        "router: json_aliases (cluster '{}') is accepted by the config schema but is not applied \
+         to routing decisions, so it would silently have no effect. Remove it. To route on a \
+         request body field, use a classifier filter to promote the value to a header and match \
+         that header with the route's `headers` field.",
+        route_config.route.cluster,
+    )
+    .into())
+}
+
 /// Validates global alias options when alias routes exist.
 fn validate_alias_options(routes: &[RouterRouteConfig], max_bytes: usize) -> Result<(), FilterError> {
     let has_aliases = routes.iter().any(|r| r.json_aliases.is_some());
@@ -340,23 +359,32 @@ fn validate_alias_options(routes: &[RouterRouteConfig], max_bytes: usize) -> Res
     Ok(())
 }
 
-/// Converts raw routes into resolved routes with pre-computed wildcard suffixes.
+/// Converts raw routes into resolved routes with pre-computed labels/suffixes.
 fn resolve_routes(routes: Vec<RouterRouteConfig>) -> Vec<ResolvedRoute> {
     routes
         .into_iter()
         .map(|route_config| {
             let route = route_config.route;
+            let metrics_label = path_match_metrics_label(&route.path_match);
             let wildcard_suffix = route.host.as_ref().and_then(|h| h.strip_prefix("*.")).map(|suffix| {
                 let lower = suffix.to_ascii_lowercase();
                 format!(".{lower}")
             });
             ResolvedRoute {
                 route,
-                json_aliases: route_config.json_aliases,
+                metrics_label,
                 wildcard_suffix,
             }
         })
         .collect()
+}
+
+/// Exact → bare path; Prefix → `path*`.
+fn path_match_metrics_label(path_match: &PathMatch) -> ::metrics::SharedString {
+    match path_match {
+        PathMatch::Exact { path } => ::metrics::SharedString::from(path.clone()),
+        PathMatch::Prefix { path_prefix } => ::metrics::SharedString::from(format!("{path_prefix}*")),
+    }
 }
 
 #[async_trait]
@@ -386,13 +414,14 @@ impl HttpFilter for RouterFilter {
             .or_else(|| ctx.request.uri.authority().map(http::uri::Authority::as_str));
 
         trace!(path = %path, host = host.unwrap_or(""), "matching route");
-        if let Some(route) = self.match_route(path, host, &ctx.request.headers) {
+        if let Some(resolved) = self.match_route(path, host, &ctx.request.headers) {
             debug!(
                 path = %path,
-                cluster = %route.cluster,
+                cluster = %resolved.route.cluster,
                 "route matched"
             );
-            ctx.cluster = Some(Arc::clone(&route.cluster));
+            ctx.metrics_route = Some(resolved.metrics_label.clone());
+            ctx.cluster = Some(Arc::clone(&resolved.route.cluster));
             Ok(FilterAction::Continue)
         } else {
             debug!(path = %path, "no route matched");

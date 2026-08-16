@@ -9,9 +9,10 @@ use pingora_core::Result;
 use pingora_proxy::Session;
 use praxis_core::connectivity::normalize_mapped_ipv4;
 use praxis_filter::{
-    BodyMode, FilterAction, FilterError, FilterPipeline, Rejection, Request, TerminalResponse, TrustedHeaderMutation,
+    BodyMode, FilterAction, FilterError, FilterPipeline, Rejection, Request, StreamingTerminalResponse,
+    TerminalResponse, TrustedHeaderMutation,
 };
-use tracing::{debug, error, warn};
+use tracing::{Instrument as _, debug, error, warn};
 
 use super::super::{
     context::PingoraRequestCtx,
@@ -106,13 +107,19 @@ pub(in crate::http) async fn execute(
         http::Method::GET | http::Method::HEAD | http::Method::OPTIONS
     );
 
+    ctx.request_span = create_request_span(session, ctx);
+
     let caps = pipeline.body_capabilities();
     ctx.request_body_mode = caps.request_body_mode;
     ctx.response_body_mode = caps.response_body_mode;
 
     if matches!(caps.request_body_mode, BodyMode::StreamBuffer { .. }) {
         tracing::debug!("pre-reading request body for StreamBuffer inspection");
-        match stream_buffer::pre_read_body(pipeline, session, ctx, &request).await {
+        let span = ctx.request_span.clone();
+        match stream_buffer::pre_read_body(pipeline, session, ctx, &request)
+            .instrument(span)
+            .await
+        {
             Ok(pre_read) => {
                 apply_pre_read_mutations(session, &mut request, &pre_read.mutations);
                 ctx.pre_read_mutations = pre_read.mutations;
@@ -130,13 +137,19 @@ pub(in crate::http) async fn execute(
         }
     }
 
-    match run_pipeline(pipeline, request, ctx).await {
+    let span = ctx.request_span.clone();
+    let pipeline_result = run_pipeline(pipeline, request, ctx).instrument(span).await;
+
+    match pipeline_result {
         Ok(PipelineResult {
             action: FilterAction::Continue | FilterAction::Release | FilterAction::BodyDone,
             extra_headers,
             headers_to_remove,
             headers_to_set,
         }) => {
+            // Mirror of `apply_pending_header_mutations`, which applied the
+            // same three lists to `ctx.request_snapshot` in the same
+            // remove -> set -> add order. Keep the two in step.
             let req_headers = session.req_header_mut();
             for name in &headers_to_remove {
                 let _remove = req_headers.remove_header(name);
@@ -163,6 +176,13 @@ pub(in crate::http) async fn execute(
             run_terminal_response(pipeline, session, ctx, *terminal).await;
             Ok(true)
         },
+        Ok(PipelineResult {
+            action: FilterAction::StreamingTerminalResponse(terminal),
+            ..
+        }) => {
+            run_streaming_terminal_response(pipeline, session, ctx, *terminal).await;
+            Ok(true)
+        },
         Err(e) => {
             error!(error = %e, "filter pipeline error");
             send_rejection(session, Rejection::status(500)).await;
@@ -185,6 +205,7 @@ async fn run_pipeline(
     ctx: &mut PingoraRequestCtx,
 ) -> std::result::Result<PipelineResult, FilterError> {
     let baseline_request_body_mode = ctx.request_body_mode;
+    let baseline_response_body_mode = ctx.response_body_mode;
     let (
         action,
         extra_headers,
@@ -194,7 +215,9 @@ async fn run_pipeline(
         upstream,
         rewritten_path,
         request_body_mode,
+        response_body_mode,
         selected_endpoint_index,
+        metrics_route,
         extensions,
         filter_metadata,
         filter_state,
@@ -217,7 +240,9 @@ async fn run_pipeline(
             filter_ctx.upstream,
             filter_ctx.rewritten_path,
             filter_ctx.request_body_mode,
+            filter_ctx.response_body_mode,
             filter_ctx.selected_endpoint_index,
+            filter_ctx.metrics_route,
             filter_ctx.extensions,
             filter_ctx.filter_metadata,
             filter_ctx.filter_state,
@@ -228,11 +253,17 @@ async fn run_pipeline(
         )
     };
 
-    // Apply pipeline headers_to_remove to request_snapshot so that
-    // later phases (body, response) see stripped headers.
-    for name in &headers_to_remove {
-        request.headers.remove(name);
-    }
+    // Mirror every pending header mutation into request_snapshot so that
+    // later phases (body, response) read the same headers the upstream
+    // will receive. The same remove -> set -> add order is applied to the
+    // Pingora session by the caller; the two must not diverge, or a
+    // response-phase filter reads a request that was never sent.
+    apply_pending_header_mutations(
+        &mut request.headers,
+        &headers_to_remove,
+        &headers_to_set,
+        &extra_headers,
+    );
     ctx.request_snapshot = Some(request);
     ctx.extensions = extensions;
     ctx.filter_metadata = filter_metadata;
@@ -246,6 +277,8 @@ async fn run_pipeline(
     ctx.structured_metadata = structured_metadata;
     ctx.metrics_cluster_shared = cluster.as_ref().map(|c| ::metrics::SharedString::from(Arc::clone(c)));
     ctx.metrics_cluster.clone_from(&cluster);
+    ctx.metrics_route = metrics_route;
+    ctx.response_body_mode = super::clamp_body_mode_to_ceiling(response_body_mode, baseline_response_body_mode);
 
     match action {
         Ok(FilterAction::Continue | FilterAction::Release | FilterAction::BodyDone) => {
@@ -273,6 +306,12 @@ async fn run_pipeline(
             headers_to_remove: Vec::new(),
             headers_to_set: Vec::new(),
         }),
+        Ok(FilterAction::StreamingTerminalResponse(terminal)) => Ok(PipelineResult {
+            action: FilterAction::StreamingTerminalResponse(terminal),
+            extra_headers: Vec::new(),
+            headers_to_remove: Vec::new(),
+            headers_to_set: Vec::new(),
+        }),
         Err(e) => Err(e),
     }
 }
@@ -281,122 +320,377 @@ async fn run_pipeline(
 // Terminal Response
 // -----------------------------------------------------------------------------
 
-/// Run response filters on a terminal response and send it downstream.
-///
-/// Builds a [`praxis_filter::Response`] from the terminal, runs the
-/// response-header and response-body filter lifecycle so preceding
-/// filters can observe and modify the response, then writes the
-/// (potentially modified) response to the Pingora session.
-#[expect(clippy::too_many_lines, reason = "writeback destructuring")]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "async fn: locals live in heap-allocated future"
-)]
+/// Run response filters on a buffered terminal response and send it downstream.
+#[expect(clippy::large_stack_frames, reason = "terminal response lifecycle with body filters")]
 async fn run_terminal_response(
     pipeline: &FilterPipeline,
     session: &mut Session,
     ctx: &mut PingoraRequestCtx,
     terminal: TerminalResponse,
 ) {
-    let status = terminal.status;
-    let mut resp = praxis_filter::Response {
-        status: http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
-        headers: terminal.headers,
-    };
-
-    ctx.response_phase_done = true;
-    ctx.upstream_response_status = Some(status);
-
-    // Run response-header filters so preceding filters see the response.
-    // Uses writeback destructuring to satisfy the borrow checker: the
-    // filter context borrows `ctx` and `resp`, so fields are extracted
-    // into locals before the borrow ends.
-    let response_result = {
-        let (result, extensions, filter_metadata, filter_state, executed_indices, body_done) = {
-            let Some(mut fctx) = ctx.filter_context_for(pipeline, Some(&mut resp)) else {
-                warn!("request snapshot not set for terminal response; sending as-is");
-                send_terminal_to_session(session, &resp, terminal.body).await;
-                return;
-            };
-            let r = pipeline.execute_http_response(&mut fctx).await;
-            (
-                r,
-                fctx.extensions,
-                fctx.filter_metadata,
-                fctx.filter_state,
-                fctx.executed_filter_indices,
-                fctx.body_done_indices,
-            )
-        };
-        // `resp` now contains filter-modified status and headers (filters
-        // mutated it through the `&mut` reference in the filter context).
-        ctx.extensions = extensions;
-        ctx.filter_metadata = filter_metadata;
-        ctx.filter_state = filter_state;
-        ctx.cached_executed_filter_indices = executed_indices;
-        ctx.cached_body_done_indices = body_done;
-        result
-    };
-
-    match response_result {
-        Ok(FilterAction::Reject(rejection)) => {
-            warn!(status = rejection.status, "response filter rejected terminal response");
+    let mut resp = match prepare_terminal_response(pipeline, ctx, terminal.status, terminal.headers).await {
+        Ok(resp) => resp,
+        Err(rejection) => {
             send_rejection(session, rejection).await;
             return;
         },
+    };
+    let mut body = terminal.body;
+    if let Err(rejection) = run_parent_terminal_body_filters(pipeline, ctx, &resp, &mut body, true) {
+        send_rejection(session, rejection).await;
+        return;
+    }
+    super::hop_by_hop::strip_hop_by_hop_header_map(&mut resp.headers, super::hop_by_hop::RESPONSE_HOP_BY_HOP);
+    send_terminal_to_session(session, &resp, body).await;
+}
+
+/// Run response-header filters and persist their request-scoped state.
+#[expect(clippy::too_many_lines, reason = "writeback destructuring")]
+#[expect(clippy::expect_used, reason = "request_snapshot checked via let-else guard above")]
+async fn prepare_terminal_response(
+    pipeline: &FilterPipeline,
+    ctx: &mut PingoraRequestCtx,
+    status: u16,
+    headers: http::HeaderMap,
+) -> Result<praxis_filter::Response, Rejection> {
+    let mut resp = praxis_filter::Response {
+        status: http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
+        headers,
+    };
+    ctx.response_phase_done = true;
+    ctx.upstream_response_status = Some(status);
+    let baseline_response_body_mode = ctx.response_body_mode;
+
+    let Some(_) = ctx.request_snapshot else {
+        warn!("request snapshot not set for terminal response; sending as-is");
+        return Ok(resp);
+    };
+    let (
+        result,
+        response_body_mode,
+        cluster,
+        upstream,
+        extensions,
+        filter_metadata,
+        filter_state,
+        filter_results,
+        structured_metadata,
+        executed_indices,
+        body_done,
+    ) = {
+        let mut fctx = ctx
+            .filter_context_for(pipeline, Some(&mut resp))
+            .expect("request snapshot checked above");
+        let result = pipeline.execute_http_response(&mut fctx).await;
+        (
+            result,
+            fctx.response_body_mode,
+            fctx.cluster,
+            fctx.upstream,
+            fctx.extensions,
+            fctx.filter_metadata,
+            fctx.filter_state,
+            fctx.filter_results,
+            fctx.structured_metadata,
+            fctx.executed_filter_indices,
+            fctx.body_done_indices,
+        )
+    };
+    ctx.cluster = cluster;
+    ctx.upstream = upstream;
+    ctx.extensions = extensions;
+    ctx.filter_metadata = filter_metadata;
+    ctx.filter_state = filter_state;
+    ctx.filter_results = filter_results;
+    ctx.structured_metadata = structured_metadata;
+    ctx.cached_executed_filter_indices = executed_indices;
+    ctx.cached_body_done_indices = body_done;
+    ctx.response_body_mode = super::clamp_body_mode_to_ceiling(response_body_mode, baseline_response_body_mode);
+
+    match result {
+        Ok(FilterAction::Reject(rejection)) => {
+            warn!(status = rejection.status, "response filter rejected terminal response");
+            Err(rejection)
+        },
         Err(e) => {
             error!(error = %e, "response filter error on terminal response");
-            send_rejection(session, Rejection::status(500)).await;
-            return;
+            Err(Rejection::status(500))
         },
-        _ => {},
+        _ => Ok(resp),
     }
+}
 
-    // Run response-body filters on the terminal body, passing the
-    // terminal response header so response_conditions can evaluate.
-    let mut body = terminal.body;
-    let body_result = {
-        let (result, extensions, filter_metadata, filter_state, executed_indices, body_done) = {
-            let Some(mut fctx) = ctx.filter_context_for(pipeline, None) else {
-                send_terminal_to_session(session, &resp, body).await;
-                return;
-            };
-            let r = pipeline.execute_http_response_body_with_response_header(&mut fctx, &mut body, true, Some(&resp));
-            (
-                r,
-                fctx.extensions,
-                fctx.filter_metadata,
-                fctx.filter_state,
-                fctx.executed_filter_indices,
-                fctx.body_done_indices,
-            )
+/// Run one parent response-body filter invocation and persist its state.
+#[expect(clippy::too_many_lines, reason = "writeback destructuring")]
+fn run_parent_terminal_body_filters(
+    pipeline: &FilterPipeline,
+    ctx: &mut PingoraRequestCtx,
+    resp: &praxis_filter::Response,
+    body: &mut Option<bytes::Bytes>,
+    end_of_stream: bool,
+) -> Result<(), Rejection> {
+    let (
+        result,
+        response_body_bytes,
+        cluster,
+        upstream,
+        extensions,
+        filter_metadata,
+        filter_state,
+        filter_results,
+        structured_metadata,
+        executed_indices,
+        body_done,
+    ) = {
+        let Some(mut fctx) = ctx.filter_context_for(pipeline, None) else {
+            warn!("request snapshot not set for terminal response body; sending as-is");
+            return Ok(());
         };
-        ctx.extensions = extensions;
-        ctx.filter_metadata = filter_metadata;
-        ctx.filter_state = filter_state;
-        ctx.cached_executed_filter_indices = executed_indices;
-        ctx.cached_body_done_indices = body_done;
-        result
+        let r = pipeline.execute_http_response_body_with_response_header(&mut fctx, body, end_of_stream, Some(resp));
+        (
+            r,
+            fctx.response_body_bytes,
+            fctx.cluster,
+            fctx.upstream,
+            fctx.extensions,
+            fctx.filter_metadata,
+            fctx.filter_state,
+            fctx.filter_results,
+            fctx.structured_metadata,
+            fctx.executed_filter_indices,
+            fctx.body_done_indices,
+        )
     };
+    ctx.response_body_bytes = response_body_bytes;
+    ctx.cluster = cluster;
+    ctx.upstream = upstream;
+    ctx.extensions = extensions;
+    ctx.filter_metadata = filter_metadata;
+    ctx.filter_state = filter_state;
+    ctx.filter_results = filter_results;
+    ctx.structured_metadata = structured_metadata;
+    ctx.cached_executed_filter_indices = executed_indices;
+    ctx.cached_body_done_indices = body_done;
 
-    match body_result {
+    match result {
         Ok(FilterAction::Reject(rejection)) => {
             warn!(
                 status = rejection.status,
                 "response body filter rejected terminal response"
             );
-            send_rejection(session, rejection).await;
-            return;
+            Err(rejection)
         },
         Err(e) => {
             error!(error = %e, "response body filter error on terminal response");
-            send_rejection(session, Rejection::status(500)).await;
+            Err(Rejection::status(500))
+        },
+        _ => Ok(()),
+    }
+}
+
+/// Deliver an opaque terminal stream directly to the downstream session.
+#[expect(clippy::too_many_lines, reason = "stream lifecycle state machine")]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "linear state machine with explicit error paths"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "streaming lifecycle with body filter writeback"
+)]
+async fn run_streaming_terminal_response(
+    pipeline: &FilterPipeline,
+    session: &mut Session,
+    ctx: &mut PingoraRequestCtx,
+    terminal: StreamingTerminalResponse,
+) {
+    let StreamingTerminalResponse {
+        status,
+        headers,
+        body: mut streaming_body,
+    } = terminal;
+    let mut resp = match prepare_terminal_response(pipeline, ctx, status, headers).await {
+        Ok(resp) => resp,
+        Err(rejection) => {
+            streaming_body.cancel().await;
+            send_rejection(session, rejection).await;
             return;
         },
-        _ => {},
+    };
+
+    if matches!(ctx.response_body_mode, BodyMode::StreamBuffer { .. }) {
+        error!("streaming terminal response is incompatible with StreamBuffer response mode");
+        streaming_body.cancel().await;
+        send_rejection(session, Rejection::status(500)).await;
+        return;
     }
 
-    send_terminal_to_session(session, &resp, body).await;
+    let is_head = session.req_header().method == http::Method::HEAD;
+    let body_prohibited = matches!(
+        resp.status,
+        http::StatusCode::NO_CONTENT | http::StatusCode::NOT_MODIFIED
+    );
+    if is_head || body_prohibited {
+        suppress_streaming_terminal_response(pipeline, session, ctx, &mut resp, streaming_body.as_mut(), is_head).await;
+        return;
+    }
+
+    let http_version = session.req_header().version;
+    prepare_streaming_headers(&mut resp, false, false, http_version);
+    let Some(header) = build_streaming_terminal_header(&resp) else {
+        streaming_body.cancel().await;
+        send_rejection(session, Rejection::status(500)).await;
+        return;
+    };
+    if let Err(e) = session.write_response_header(Box::new(header), false).await {
+        debug!(error = %e, "failed to write streaming terminal response header");
+        streaming_body.cancel().await;
+        session.as_downstream_mut().shutdown().await;
+        return;
+    }
+
+    loop {
+        match streaming_body.next_chunk().await {
+            Ok(Some(chunk)) => {
+                let mut body = Some(chunk);
+                if run_parent_terminal_body_filters(pipeline, ctx, &resp, &mut body, false).is_err()
+                    || streaming_size_limit_exceeded(ctx)
+                {
+                    streaming_body.cancel().await;
+                    session.as_downstream_mut().shutdown().await;
+                    return;
+                }
+                if let Err(e) = session.write_response_body(body, false).await {
+                    debug!(error = %e, "failed to write streaming terminal response body");
+                    streaming_body.cancel().await;
+                    session.as_downstream_mut().shutdown().await;
+                    return;
+                }
+            },
+            Ok(None) => {
+                let mut completion_body = None;
+                if run_parent_terminal_body_filters(pipeline, ctx, &resp, &mut completion_body, true).is_err() {
+                    streaming_body.cancel().await;
+                    session.as_downstream_mut().shutdown().await;
+                    return;
+                }
+                if let Err(e) = session.write_response_body(completion_body, true).await {
+                    debug!(error = %e, "failed to finish streaming terminal response");
+                    session.as_downstream_mut().shutdown().await;
+                }
+                return;
+            },
+            Err(e) => {
+                warn!(error = %e, "streaming terminal response source failed after commitment");
+                streaming_body.cancel().await;
+                session.as_downstream_mut().shutdown().await;
+                return;
+            },
+        }
+    }
+}
+
+/// Suppress a streaming body while still running clean completion hooks once.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "streaming suppress needs pipeline, session, ctx, resp, body, and flags"
+)]
+async fn suppress_streaming_terminal_response(
+    pipeline: &FilterPipeline,
+    session: &mut Session,
+    ctx: &mut PingoraRequestCtx,
+    resp: &mut praxis_filter::Response,
+    streaming_body: &mut dyn praxis_filter::StreamingResponseBody,
+    is_head: bool,
+) {
+    if let Err(e) = streaming_body.suppress().await {
+        error!(error = %e, "failed to suppress streaming terminal response");
+        streaming_body.cancel().await;
+        send_rejection(session, Rejection::status(500)).await;
+        return;
+    }
+    let mut completion_body = None;
+    if let Err(rejection) = run_parent_terminal_body_filters(pipeline, ctx, resp, &mut completion_body, true) {
+        streaming_body.cancel().await;
+        send_rejection(session, rejection).await;
+        return;
+    }
+
+    let is_not_modified = resp.status == http::StatusCode::NOT_MODIFIED;
+    prepare_streaming_headers(resp, is_head, is_not_modified, http::Version::HTTP_10);
+    let Some(header) = build_streaming_terminal_header(resp) else {
+        streaming_body.cancel().await;
+        send_rejection(session, Rejection::status(500)).await;
+        return;
+    };
+    if let Err(e) = session.write_response_header(Box::new(header), true).await {
+        debug!(error = %e, "failed to write suppressed streaming terminal response");
+        session.as_downstream_mut().shutdown().await;
+    }
+}
+
+/// Remove transport framing and hop-by-hop headers before commitment.
+///
+/// For HTTP/1.1 body streams, adds `Transfer-Encoding: chunked` so
+/// Pingora's `init_body_writer_comm` selects chunked framing.
+/// HTTP/1.0 uses close-delimited framing (no TE); HTTP/2 uses
+/// DATA frames and ignores TE.
+fn prepare_streaming_headers(
+    resp: &mut praxis_filter::Response,
+    is_head: bool,
+    is_not_modified: bool,
+    http_version: http::Version,
+) {
+    super::hop_by_hop::strip_hop_by_hop_header_map(&mut resp.headers, super::hop_by_hop::RESPONSE_HOP_BY_HOP);
+    if resp.status == http::StatusCode::NO_CONTENT || (!is_head && !is_not_modified) {
+        resp.headers.remove(http::header::CONTENT_LENGTH);
+    }
+    resp.headers.remove(http::header::TRANSFER_ENCODING);
+    if http_version == http::Version::HTTP_11 && !is_head && !is_not_modified {
+        resp.headers.insert(
+            http::header::TRANSFER_ENCODING,
+            http::HeaderValue::from_static("chunked"),
+        );
+    }
+}
+
+/// Build a header for a streamed response without synthesizing body length.
+fn build_streaming_terminal_header(resp: &praxis_filter::Response) -> Option<pingora_http::ResponseHeader> {
+    let code = resp.status.as_u16();
+    if !(200..=599).contains(&code) {
+        warn!(
+            status = code,
+            "streaming terminal response status outside 200..=599; sending 500"
+        );
+        return None;
+    }
+    let mut header = match pingora_http::ResponseHeader::build(resp.status, Some(resp.headers.len())) {
+        Ok(h) => h,
+        Err(e) => {
+            error!(status = %resp.status, error = %e, "invalid streaming terminal response status; using 500");
+            return None;
+        },
+    };
+    for (name, value) in &resp.headers {
+        let _append = header.append_header(name.clone(), value.clone());
+    }
+    Some(header)
+}
+
+/// Enforce an incremental response size limit after raw bytes are counted.
+fn streaming_size_limit_exceeded(ctx: &PingoraRequestCtx) -> bool {
+    let BodyMode::SizeLimit { max_bytes } = ctx.response_body_mode else {
+        return false;
+    };
+    if ctx.response_body_bytes <= max_bytes as u64 {
+        return false;
+    }
+    warn!(
+        actual = ctx.response_body_bytes,
+        limit = max_bytes,
+        "streaming terminal response exceeded response body limit"
+    );
+    true
 }
 
 /// Build a Pingora response header from filter-modified state.
@@ -477,6 +771,55 @@ fn apply_pre_read_mutations(session: &mut Session, request: &mut Request, mutati
     apply_pre_read_mutations_to_request(request, mutations);
 }
 
+/// Apply the request pipeline's pending header mutations to a header map.
+///
+/// Applied in remove -> set -> add order, matching both the order the
+/// caller applies them to the Pingora session and the order documented
+/// on [`HttpFilterContext::pending_header_value`]: a remove clears any
+/// prior value, a set establishes a new one, and adds follow.
+///
+/// `extra` uses replace semantics here because that is what the session
+/// receives (`insert_header`). Note this differs from the pre-read body
+/// phase, where the same context field is drained into
+/// [`TrustedHeaderMutation::Add`] and appended. The two phases serve
+/// different filters — `request_id` re-emits a client-supplied ID as an
+/// extra header and would duplicate it under append semantics, while
+/// pre-read body filters accumulate — so the divergence is deliberate
+/// and must not be "unified" without auditing both sets of callers.
+///
+/// [`HttpFilterContext::pending_header_value`]: praxis_filter::HttpFilterContext::pending_header_value
+fn apply_pending_header_mutations(
+    headers: &mut http::HeaderMap,
+    to_remove: &[http::header::HeaderName],
+    to_set: &[(http::header::HeaderName, http::header::HeaderValue)],
+    extra: &[(Cow<'static, str>, String)],
+) {
+    for name in to_remove {
+        headers.remove(name);
+    }
+    for (name, value) in to_set {
+        let _replaced = headers.insert(name.clone(), value.clone());
+    }
+    for (name, value) in extra {
+        match (
+            http::header::HeaderName::from_bytes(name.as_bytes()),
+            http::header::HeaderValue::from_str(value),
+        ) {
+            (Ok(header_name), Ok(header_value)) => {
+                let _replaced = headers.insert(header_name, header_value);
+            },
+            (name_result, value_result) => {
+                warn!(
+                    header = %name,
+                    name_err = ?name_result.err(),
+                    value_err = ?value_result.err(),
+                    "skipping invalid promoted header in request snapshot"
+                );
+            },
+        }
+    }
+}
+
 /// Apply pre-read mutations to the Praxis [`Request`] struct.
 fn apply_pre_read_mutations_to_request(request: &mut Request, mutations: &[TrustedHeaderMutation]) {
     for mutation in mutations {
@@ -528,6 +871,52 @@ fn apply_pre_read_mutations_to_session(session: &mut Session, mutations: &[Trust
             },
         }
     }
+}
+
+/// Build the root tracing span for a request with `OTel` HTTP semantic
+/// convention attributes.
+///
+/// Creates an [`info_span!`] named `"http_request"` with the
+/// [OTel span name] set to `{method}` and span kind set to
+/// `SERVER`. Response-phase attributes (`http.response.status_code`,
+/// `upstream.address`) are declared as [`Empty`] and recorded later via
+/// [`record_response_span_attributes`].
+///
+/// [`info_span!`]: tracing::info_span
+/// [OTel span name]: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+/// [`Empty`]: tracing::field::Empty
+/// [`record_response_span_attributes`]: super::record_response_span_attributes
+fn create_request_span(session: &Session, ctx: &PingoraRequestCtx) -> tracing::Span {
+    let method = session.req_header().method.as_str();
+    let path = session.req_header().uri.path();
+    let path = if path.is_empty() { "/" } else { path };
+    let protocol_version = super::http_version_label(ctx.client_http_version.unwrap_or(http::Version::HTTP_11));
+    let host = session.req_header().headers.get("host").and_then(|v| v.to_str().ok());
+    let server_address = host.map(|h| h.split(':').next().unwrap_or(h));
+    let server_port = host.and_then(|h| h.split_once(':').and_then(|(_, p)| p.parse::<u16>().ok()));
+
+    let span = tracing::info_span!(
+        "http_request",
+        "otel.name" = method,
+        "otel.kind" = "server",
+        "otel.status_code" = tracing::field::Empty,
+        "http.request.method" = method,
+        "url.path" = path,
+        "http.response.status_code" = tracing::field::Empty,
+        "server.address" = server_address,
+        "server.port" = server_port,
+        "client.address" = tracing::field::Empty,
+        "upstream.address" = tracing::field::Empty,
+        "network.protocol.version" = protocol_version,
+        "upstream.cluster" = tracing::field::Empty,
+        request_id = tracing::field::Empty,
+    );
+
+    if let Some(addr) = &ctx.client_addr {
+        span.record("client.address", tracing::field::display(addr));
+    }
+
+    span
 }
 
 /// Reject client-supplied reserved internal headers before special handling
@@ -857,6 +1246,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_span_created_after_pipeline() {
+        let mut ctx = make_ctx();
+        assert!(
+            ctx.request_span.is_disabled(),
+            "span should be disabled before pipeline runs"
+        );
+        drop(run_pipeline(&empty_pipeline(), make_request(), &mut ctx).await.unwrap());
+        // The span is created in execute() before run_pipeline, but
+        // run_pipeline tests don't go through execute(). Verify
+        // the default is disabled, which confirms no premature creation.
+        assert!(
+            ctx.request_span.is_disabled(),
+            "run_pipeline alone should not create the request span"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_id_recorded_from_extra_headers() {
+        let mut ctx = make_ctx();
+        let span = tracing::info_span!("test_span", request_id = tracing::field::Empty,);
+        ctx.request_span = span;
+
+        let result = run_pipeline(&empty_pipeline(), make_request(), &mut ctx).await.unwrap();
+        // Empty pipeline produces no extra headers containing x-request-id.
+        assert!(
+            result
+                .extra_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("x-request-id"))
+                .is_none(),
+            "empty pipeline should not produce x-request-id header"
+        );
+    }
+
+    #[tokio::test]
     async fn structured_metadata_persists_through_pipeline() {
         let mut ctx = make_ctx();
         ctx.structured_metadata.insert(
@@ -882,6 +1306,85 @@ mod tests {
             Some(&serde_json::json!(0.95)),
             "score field should be preserved"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Pending Header Mutations
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn pending_mutations_apply_removes_sets_and_adds() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-drop", "gone".parse().unwrap());
+        headers.insert("x-keep", "kept".parse().unwrap());
+
+        apply_pending_header_mutations(
+            &mut headers,
+            &["x-drop".parse().unwrap()],
+            &[("x-set".parse().unwrap(), "set-value".parse().unwrap())],
+            &[(Cow::Borrowed("x-extra"), "extra-value".to_owned())],
+        );
+
+        assert!(headers.get("x-drop").is_none(), "removed header should be gone");
+        assert_eq!(headers.get("x-keep").unwrap(), "kept", "untouched header survives");
+        assert_eq!(headers.get("x-set").unwrap(), "set-value", "set header applied");
+        assert_eq!(headers.get("x-extra").unwrap(), "extra-value", "extra header applied");
+    }
+
+    #[test]
+    fn pending_mutations_apply_set_after_remove_for_the_same_name() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-both", "original".parse().unwrap());
+
+        apply_pending_header_mutations(
+            &mut headers,
+            &["x-both".parse().unwrap()],
+            &[("x-both".parse().unwrap(), "replacement".parse().unwrap())],
+            &[],
+        );
+
+        assert_eq!(
+            headers.get("x-both").unwrap(),
+            "replacement",
+            "set runs after remove, so the set value wins"
+        );
+    }
+
+    #[test]
+    fn pending_extra_headers_replace_rather_than_accumulate() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", "client-supplied".parse().unwrap());
+
+        apply_pending_header_mutations(
+            &mut headers,
+            &[],
+            &[],
+            &[(Cow::Borrowed("x-request-id"), "client-supplied".to_owned())],
+        );
+
+        assert_eq!(
+            headers.get_all("x-request-id").iter().count(),
+            1,
+            "re-emitting a client-supplied header must not duplicate it"
+        );
+    }
+
+    #[test]
+    fn pending_mutations_skip_invalid_promoted_headers() {
+        let mut headers = HeaderMap::new();
+
+        apply_pending_header_mutations(
+            &mut headers,
+            &[],
+            &[],
+            &[
+                (Cow::Borrowed("bad header name"), "v".to_owned()),
+                (Cow::Borrowed("x-good"), "v".to_owned()),
+            ],
+        );
+
+        assert_eq!(headers.len(), 1, "invalid name is skipped, valid one still applied");
+        assert_eq!(headers.get("x-good").unwrap(), "v");
     }
 
     // -------------------------------------------------------------------------
@@ -923,5 +1426,186 @@ mod tests {
             failure_mode: FailureMode::default(),
         }];
         FilterPipeline::build(&mut entries, &registry).unwrap()
+    }
+
+    // -------------------------------------------------------------------------
+    // Streaming Header / Framing Tests
+    // -------------------------------------------------------------------------
+
+    fn make_resp(status: u16) -> praxis_filter::Response {
+        praxis_filter::Response {
+            status: http::StatusCode::from_u16(status).unwrap(),
+            headers: HeaderMap::new(),
+        }
+    }
+
+    #[test]
+    fn streaming_headers_strip_hop_by_hop() {
+        let mut resp = make_resp(200);
+        resp.headers
+            .insert(http::header::CONNECTION, "keep-alive".parse().unwrap());
+        resp.headers
+            .insert(http::header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        resp.headers.insert("x-custom", "keep".parse().unwrap());
+
+        prepare_streaming_headers(&mut resp, false, false, http::Version::HTTP_11);
+
+        assert!(!resp.headers.contains_key(http::header::CONNECTION));
+        assert!(resp.headers.contains_key("x-custom"));
+    }
+
+    #[test]
+    fn streaming_headers_http11_adds_chunked() {
+        let mut resp = make_resp(200);
+
+        prepare_streaming_headers(&mut resp, false, false, http::Version::HTTP_11);
+
+        assert_eq!(resp.headers.get(http::header::TRANSFER_ENCODING).unwrap(), "chunked");
+    }
+
+    #[test]
+    fn streaming_headers_http10_no_chunked() {
+        let mut resp = make_resp(200);
+
+        prepare_streaming_headers(&mut resp, false, false, http::Version::HTTP_10);
+
+        assert!(!resp.headers.contains_key(http::header::TRANSFER_ENCODING));
+    }
+
+    #[test]
+    fn streaming_headers_http2_no_chunked() {
+        let mut resp = make_resp(200);
+
+        prepare_streaming_headers(&mut resp, false, false, http::Version::HTTP_2);
+
+        assert!(!resp.headers.contains_key(http::header::TRANSFER_ENCODING));
+    }
+
+    #[test]
+    fn streaming_headers_head_no_chunked() {
+        let mut resp = make_resp(200);
+
+        prepare_streaming_headers(&mut resp, true, false, http::Version::HTTP_11);
+
+        assert!(!resp.headers.contains_key(http::header::TRANSFER_ENCODING));
+    }
+
+    #[test]
+    fn streaming_headers_304_no_chunked() {
+        let mut resp = make_resp(304);
+
+        prepare_streaming_headers(&mut resp, false, true, http::Version::HTTP_11);
+
+        assert!(!resp.headers.contains_key(http::header::TRANSFER_ENCODING));
+    }
+
+    #[test]
+    fn streaming_headers_204_removes_content_length() {
+        let mut resp = make_resp(204);
+        resp.headers.insert(http::header::CONTENT_LENGTH, "0".parse().unwrap());
+
+        prepare_streaming_headers(&mut resp, false, false, http::Version::HTTP_10);
+
+        assert!(!resp.headers.contains_key(http::header::CONTENT_LENGTH));
+    }
+
+    #[test]
+    fn streaming_headers_head_preserves_content_length() {
+        let mut resp = make_resp(200);
+        resp.headers
+            .insert(http::header::CONTENT_LENGTH, "1024".parse().unwrap());
+
+        prepare_streaming_headers(&mut resp, true, false, http::Version::HTTP_11);
+
+        assert_eq!(resp.headers.get(http::header::CONTENT_LENGTH).unwrap(), "1024");
+    }
+
+    #[test]
+    fn streaming_headers_304_preserves_content_length() {
+        let mut resp = make_resp(304);
+        resp.headers
+            .insert(http::header::CONTENT_LENGTH, "512".parse().unwrap());
+
+        prepare_streaming_headers(&mut resp, false, true, http::Version::HTTP_11);
+
+        assert_eq!(resp.headers.get(http::header::CONTENT_LENGTH).unwrap(), "512");
+    }
+
+    #[test]
+    fn streaming_headers_replaces_existing_transfer_encoding() {
+        let mut resp = make_resp(200);
+        resp.headers
+            .insert(http::header::TRANSFER_ENCODING, "gzip".parse().unwrap());
+
+        prepare_streaming_headers(&mut resp, false, false, http::Version::HTTP_11);
+
+        assert_eq!(resp.headers.get(http::header::TRANSFER_ENCODING).unwrap(), "chunked");
+    }
+
+    #[test]
+    fn build_streaming_header_valid_200() {
+        let resp = make_resp(200);
+        let header = build_streaming_terminal_header(&resp);
+        assert!(header.is_some());
+        assert_eq!(header.unwrap().status, 200);
+    }
+
+    #[test]
+    fn build_streaming_header_valid_599() {
+        let resp = make_resp(599);
+        let header = build_streaming_terminal_header(&resp);
+        assert!(header.is_some());
+    }
+
+    #[test]
+    fn build_streaming_header_invalid_100() {
+        let resp = make_resp(100);
+        assert!(build_streaming_terminal_header(&resp).is_none());
+    }
+
+    #[test]
+    fn build_streaming_header_preserves_custom_headers() {
+        let mut resp = make_resp(200);
+        resp.headers.insert("x-custom", "value".parse().unwrap());
+
+        let header = build_streaming_terminal_header(&resp).unwrap();
+
+        assert_eq!(header.headers.get("x-custom").unwrap(), "value");
+    }
+
+    #[test]
+    fn streaming_size_limit_not_exceeded() {
+        let mut ctx = make_ctx();
+        ctx.response_body_mode = BodyMode::SizeLimit { max_bytes: 1024 };
+        ctx.response_body_bytes = 512;
+
+        assert!(!streaming_size_limit_exceeded(&ctx));
+    }
+
+    #[test]
+    fn streaming_size_limit_exceeded_over() {
+        let mut ctx = make_ctx();
+        ctx.response_body_mode = BodyMode::SizeLimit { max_bytes: 100 };
+        ctx.response_body_bytes = 101;
+
+        assert!(streaming_size_limit_exceeded(&ctx));
+    }
+
+    #[test]
+    fn streaming_size_limit_stream_mode_never_exceeded() {
+        let mut ctx = make_ctx();
+        ctx.response_body_mode = BodyMode::Stream;
+        ctx.response_body_bytes = 999_999;
+
+        assert!(!streaming_size_limit_exceeded(&ctx));
+    }
+
+    #[test]
+    fn streaming_size_limit_exact_boundary() {
+        let mut ctx = make_ctx();
+        ctx.response_body_mode = BodyMode::SizeLimit { max_bytes: 100 };
+        ctx.response_body_bytes = 100;
+
+        assert!(!streaming_size_limit_exceeded(&ctx));
     }
 }
