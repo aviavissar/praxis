@@ -2,6 +2,20 @@
 // Copyright (c) 2024 Praxis Contributors
 
 #![deny(unreachable_pub)]
+#![expect(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::impl_trait_in_params,
+    clippy::iter_over_hash_type,
+    clippy::min_ident_chars,
+    clippy::mod_module_files,
+    clippy::partial_pub_fields,
+    clippy::shadow_unrelated,
+    clippy::single_char_lifetime_names,
+    clippy::struct_field_names,
+    clippy::wildcard_enum_match_arm,
+    reason = "TODO(conventions-sync): fix violations and remove"
+)]
 
 //! Filter pipeline engine for Praxis.
 
@@ -28,14 +42,14 @@ pub use any_filter::AnyFilter;
 pub use body::{BodyAccess, BodyBuffer, BodyBufferOverflow, BodyCapabilities, BodyMode};
 #[cfg(feature = "basic-auth-filter")]
 pub use builtins::BasicAuthFilter;
-#[cfg(feature = "cpex-policy-engine")]
-pub use builtins::PolicyFilter;
 pub use builtins::{
     CircuitBreakerFilter, ContainsValue, CredentialInjectionFilter, DisallowedOriginMode, EndpointSelectorFilter,
     GuardrailsAction, GuardrailsFilter, LoadBalancerFilter, PiiKind, RateLimitMode, RedirectStatus, RouterFilter,
     RuleTargetKind, has_dot_dot_traversal, http::payload_processing::compression_config::CompressionConfig,
     normalize_rewritten_path,
 };
+#[cfg(feature = "policy-engine")]
+pub use builtins::{PolicyFilter, PolicyPluginFactoryFn, register_policy_plugin_factory};
 pub use condition::{should_execute, should_execute_response, should_execute_response_ref};
 pub use context::{
     HttpFilterContext, PendingHeaderResult, Request, Response, SubRequestResponseMode, TrustedHeaderMutation,
