@@ -48,9 +48,11 @@ fn discover_markdown(root: &Path) -> Vec<PathBuf> {
     let mut md_files = Vec::new();
     for dir in scan_dirs {
         let abs = root.join(dir);
-        if abs.is_dir() {
-            collect_markdown(&abs, &mut md_files);
+        if !abs.is_dir() {
+            eprintln!("error: scan root {dir}/ does not exist or is not a directory");
+            std::process::exit(1);
         }
+        collect_markdown(&abs, &mut md_files);
     }
     md_files.sort();
     if md_files.is_empty() {
@@ -68,7 +70,7 @@ fn check_links(root: &Path, md_files: &[PathBuf]) -> Vec<(String, usize, String)
         let content = read_or_exit(path);
         let rel_display = path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned();
         let dir = path.parent().unwrap_or(path);
-        check_file_links(&content, dir, &rel_display, &mut broken);
+        check_file_links(&content, root, dir, &rel_display, &mut broken);
     }
     broken
 }
@@ -81,27 +83,84 @@ fn read_or_exit(path: &Path) -> String {
     })
 }
 
+/// Per-file context passed to link-checking helpers.
+struct FileCtx<'a> {
+    /// Workspace root for resolving leading-slash links.
+    root: &'a Path,
+    /// Parent directory of the current file.
+    dir: &'a Path,
+    /// Relative display path of the current file.
+    rel_display: &'a str,
+    /// Accumulator for broken-link entries.
+    broken: &'a mut Vec<(String, usize, String)>,
+}
+
 /// Check all links in one file, appending broken entries to `broken`.
-fn check_file_links(content: &str, dir: &Path, rel_display: &str, broken: &mut Vec<(String, usize, String)>) {
-    let mut in_fenced_block = false;
+/// Leading-slash targets resolve from `root`; others resolve from `dir`.
+fn check_file_links(
+    content: &str,
+    root: &Path,
+    dir: &Path,
+    rel_display: &str,
+    broken: &mut Vec<(String, usize, String)>,
+) {
+    let mut ctx = FileCtx {
+        root,
+        dir,
+        rel_display,
+        broken,
+    };
+    let mut fence: Option<(char, usize)> = None;
     for (line_no, line) in content.lines().enumerate() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fenced_block = !in_fenced_block;
-            continue;
-        }
-        if in_fenced_block {
-            continue;
-        }
-        for target in extract_md_links(line) {
-            if is_relative_md_link(target) {
-                let (file_part, _fragment) = split_fragment(target);
-                if !dir.join(file_part).is_file() {
-                    broken.push((rel_display.to_owned(), line_no + 1, target.to_owned()));
-                }
+        if let Some((marker, len)) = fence {
+            let stripped = trimmed.trim_end();
+            let run = stripped.chars().take_while(|&c| c == marker).count();
+            if run >= len && run == stripped.len() {
+                fence = None;
             }
+            continue;
+        }
+        if let Some(f) = parse_fence_open(trimmed) {
+            fence = Some(f);
+            continue;
+        }
+        check_line_links(line, line_no, &mut ctx);
+    }
+}
+
+/// Validate every link target on a single line.
+fn check_line_links(line: &str, line_no: usize, ctx: &mut FileCtx<'_>) {
+    for target in extract_md_links(line) {
+        if !is_relative_local_link(&target) {
+            continue;
+        }
+        let dest = strip_title(&target);
+        let (file_part, _) = split_fragment(dest);
+        let resolved = resolve_link(ctx.root, ctx.dir, file_part);
+        if !resolved.is_file() && !resolved.is_dir() {
+            ctx.broken.push((ctx.rel_display.to_owned(), line_no + 1, target));
         }
     }
+}
+
+/// Resolve a link target: leading-slash from `root`, otherwise from `dir`.
+fn resolve_link(root: &Path, dir: &Path, file_part: &str) -> PathBuf {
+    if file_part.starts_with('/') {
+        root.join(file_part.trim_start_matches('/'))
+    } else {
+        dir.join(file_part)
+    }
+}
+
+/// If `trimmed` is a fenced-code opening line, return `(marker_char, count)`.
+fn parse_fence_open(trimmed: &str) -> Option<(char, usize)> {
+    let first = trimmed.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let count = trimmed.chars().take_while(|&c| c == first).count();
+    (count >= 3).then_some((first, count))
 }
 
 // -----------------------------------------------------------------------------
@@ -110,20 +169,20 @@ fn check_file_links(content: &str, dir: &Path, rel_display: &str, broken: &mut V
 
 /// Extract all link targets from a single line of Markdown.
 ///
-/// Finds `[text](target)` patterns. Does not extract reference-style links
-/// (`[text][ref]`) — those are rare in this codebase and would require
-/// multi-pass parsing.
-fn extract_md_links(line: &str) -> Vec<&str> {
+/// Strips inline code spans (`` `...` ``) before scanning so that a
+/// link pattern inside backticks is not treated as a live link.
+/// Does not extract reference-style links (`[text][ref]`).
+fn extract_md_links(line: &str) -> Vec<String> {
+    let stripped = strip_inline_code(line);
     let mut links = Vec::new();
-    let mut rest = line;
+    let mut rest = stripped.as_str();
 
     while let Some(open) = rest.find("](") {
         let Some(after) = rest.get(open + 2..) else {
             break;
         };
-        // Find the matching close paren, respecting nested parens.
         if let Some(target) = balanced_paren(after) {
-            links.push(target);
+            links.push(target.to_owned());
             rest = after.get(target.len() + 1..).unwrap_or("");
         } else {
             rest = after;
@@ -131,6 +190,27 @@ fn extract_md_links(line: &str) -> Vec<&str> {
     }
 
     links
+}
+
+/// Replace every inline code span (`` `...` ``) with spaces so link
+/// patterns inside backticks are invisible to the extractor.
+fn strip_inline_code(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
+        if ch == '`' {
+            let close = line.get(i + 1..).and_then(|rest| rest.find('`'));
+            if let Some(span_len) = close {
+                for _ in 0..span_len + 2 {
+                    out.push(' ');
+                    chars.next();
+                }
+                continue;
+            }
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Return the content up to the matching `)`, allowing one level of nested
@@ -153,17 +233,33 @@ fn balanced_paren(s: &str) -> Option<&str> {
     None
 }
 
-/// Whether a link target looks like a relative Markdown path (not a URL
-/// and not an anchor-only link).
-fn is_relative_md_link(target: &str) -> bool {
-    if target.is_empty() || target.starts_with('#') {
+/// Whether a link target is a relative local path (not a URL, not
+/// anchor-only). Covers all extensions and directories.
+fn is_relative_local_link(target: &str) -> bool {
+    let dest = strip_title(target);
+    if dest.is_empty() || dest.starts_with('#') {
         return false;
     }
-    if target.contains("://") || target.starts_with("mailto:") {
-        return false;
+    !dest.contains("://") && !dest.starts_with("mailto:")
+}
+
+/// Return the destination portion of a link target, stripping an optional
+/// quoted title such as `"Read more"` or `'tooltip'`.
+fn strip_title(target: &str) -> &str {
+    let t = target.trim_end();
+    for quote in ['"', '\''] {
+        if !t.ends_with(quote) {
+            continue;
+        }
+        let found = t
+            .get(..t.len() - 1)
+            .and_then(|before| before.rfind(quote))
+            .and_then(|pos| t.get(..pos));
+        if let Some(dest) = found {
+            return dest.trim_end();
+        }
     }
-    let (file_part, _) = split_fragment(target);
-    file_part.ends_with(".md")
+    t
 }
 
 /// Split a link target into the file path and an optional `#fragment`.
@@ -178,14 +274,27 @@ fn split_fragment(target: &str) -> (&str, Option<&str>) {
 // File Collection
 // -----------------------------------------------------------------------------
 
-/// Recursively collect all `.md` files under `dir`.
+/// Recursively collect all `.md` files under `dir`, skipping symlink
+/// directories to avoid rescanning ancestor trees.
 fn collect_markdown(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|err| {
+        eprintln!("error: cannot read directory {}: {err}", dir.display());
+        std::process::exit(1);
+    });
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|err| {
+            eprintln!("error: directory entry under {}: {err}", dir.display());
+            std::process::exit(1);
+        });
+        let ft = entry.file_type().unwrap_or_else(|err| {
+            eprintln!("error: file type for {}: {err}", entry.path().display());
+            std::process::exit(1);
+        });
+        if ft.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
+        if ft.is_dir() {
             collect_markdown(&path, out);
         } else if path.extension().is_some_and(|e| e == "md") {
             out.push(path);
@@ -204,38 +313,58 @@ mod tests {
     #[test]
     fn extracts_simple_link() {
         let links = extract_md_links("see [Foo](../bar.md) for details");
-        assert_eq!(links, vec!["../bar.md"]);
+        assert_eq!(links, ["../bar.md"]);
     }
 
     #[test]
     fn extracts_multiple_links() {
         let links = extract_md_links("[A](a.md) and [B](../b.md#section)");
-        assert_eq!(links, vec!["a.md", "../b.md#section"]);
+        assert_eq!(links, ["a.md", "../b.md#section"]);
     }
 
     #[test]
     fn skips_url_links() {
-        assert!(!is_relative_md_link("https://example.com/foo.md"));
-        assert!(!is_relative_md_link("http://example.com"));
-        assert!(!is_relative_md_link("mailto:x@y.com"));
+        assert!(!is_relative_local_link("https://example.com/foo.md"));
+        assert!(!is_relative_local_link("http://example.com"));
+        assert!(!is_relative_local_link("mailto:x@y.com"));
     }
 
     #[test]
     fn skips_anchor_only_links() {
-        assert!(!is_relative_md_link("#section"));
+        assert!(!is_relative_local_link("#section"));
     }
 
     #[test]
-    fn accepts_relative_md_link() {
-        assert!(is_relative_md_link("../docs/foo.md"));
-        assert!(is_relative_md_link("foo.md#section"));
-        assert!(is_relative_md_link("./bar/baz.md"));
+    fn accepts_relative_links() {
+        assert!(is_relative_local_link("../docs/foo.md"));
+        assert!(is_relative_local_link("foo.md#section"));
+        assert!(is_relative_local_link("./bar/baz.md"));
+        assert!(is_relative_local_link("image.png"));
+        assert!(is_relative_local_link("configs/foo.yaml"));
+        assert!(is_relative_local_link("some-dir/"));
     }
 
     #[test]
-    fn rejects_non_md_link() {
-        assert!(!is_relative_md_link("image.png"));
-        assert!(!is_relative_md_link("configs/foo.yaml"));
+    fn link_with_title_is_detected() {
+        assert!(is_relative_local_link("missing.md \"Read more\""));
+        assert!(is_relative_local_link("missing.md 'tooltip'"));
+    }
+
+    #[test]
+    fn titled_link_resolves_file_part() {
+        let content = "See [details](nonexistent.md \"Read more\") here.\n";
+        let mut broken = Vec::new();
+        let dir = Path::new("/tmp");
+        check_file_links(content, dir, dir, "test.md", &mut broken);
+        assert_eq!(broken.len(), 1, "titled link should be checked");
+    }
+
+    #[test]
+    fn strip_title_works() {
+        assert_eq!(strip_title("foo.md \"title\""), "foo.md");
+        assert_eq!(strip_title("foo.md 'title'"), "foo.md");
+        assert_eq!(strip_title("foo.md"), "foo.md");
+        assert_eq!(strip_title("foo.md#frag"), "foo.md#frag");
     }
 
     #[test]
@@ -274,10 +403,23 @@ mod tests {
     }
 
     #[test]
+    fn inline_code_links_are_skipped() {
+        let links = extract_md_links("see `[example](missing.md)` in code and [real](real.md) outside");
+        assert_eq!(links, ["real.md"]);
+    }
+
+    #[test]
+    fn inline_code_link_does_not_produce_broken_entry() {
+        let content = "A `[fake](nonexistent.md)` inline code link.\n";
+        let mut broken = Vec::new();
+        let dir = Path::new("/tmp");
+        check_file_links(content, dir, dir, "test.md", &mut broken);
+        assert!(broken.is_empty(), "inline code link should not be checked: {broken:?}");
+    }
+
+    #[test]
     fn links_inside_fenced_blocks_are_ignored() {
         let content = "\
-# Title
-
 See [real](real.md) link.
 
 ```markdown
@@ -290,20 +432,64 @@ A [fake2](fake2.md) link inside a tilde fence.
 
 Another [real2](real2.md) link.
 ";
-        let mut found = Vec::new();
-        let mut in_fence = false;
-        for line in content.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-                in_fence = !in_fence;
-                continue;
-            }
-            if in_fence {
-                continue;
-            }
-            found.extend(extract_md_links(line));
-        }
-        assert_eq!(found, vec!["real.md", "real2.md"]);
+        let mut broken = Vec::new();
+        let dir = Path::new("/tmp");
+        check_file_links(content, dir, dir, "test.md", &mut broken);
+        let targets: Vec<&str> = broken.iter().map(|(_, _, t)| t.as_str()).collect();
+        assert_eq!(targets, ["real.md", "real2.md"]);
+    }
+
+    #[test]
+    fn nested_fence_does_not_close_outer() {
+        let content = "\
+````markdown
+A sample fenced block:
+```
+[fake](fake.md)
+```
+Still inside the outer fence: [fake2](fake2.md)
+````
+
+[real](real.md) outside.
+";
+        let mut broken = Vec::new();
+        let dir = Path::new("/tmp");
+        check_file_links(content, dir, dir, "test.md", &mut broken);
+        let targets: Vec<&str> = broken.iter().map(|(_, _, t)| t.as_str()).collect();
+        assert_eq!(targets, ["real.md"]);
+    }
+
+    #[test]
+    fn tilde_inside_backtick_fence_does_not_close() {
+        let content = "\
+```markdown
+~~~
+[fake](fake.md)
+~~~
+Still fenced: [fake2](fake2.md)
+```
+
+[real](real.md) outside.
+";
+        let mut broken = Vec::new();
+        let dir = Path::new("/tmp");
+        check_file_links(content, dir, dir, "test.md", &mut broken);
+        let targets: Vec<&str> = broken.iter().map(|(_, _, t)| t.as_str()).collect();
+        assert_eq!(targets, ["real.md"]);
+    }
+
+    #[test]
+    fn leading_slash_resolves_from_root() {
+        let root = workspace_root();
+        let content = "See [guide](/docs/architecture/pipeline-concepts.md) here.\n";
+        let sub = root.join("examples/some-example");
+        let dir = if sub.is_dir() { &sub } else { &root };
+        let mut broken = Vec::new();
+        check_file_links(content, &root, dir, "test.md", &mut broken);
+        assert!(
+            broken.is_empty(),
+            "leading-slash link should resolve from root: {broken:?}"
+        );
     }
 
     #[test]
